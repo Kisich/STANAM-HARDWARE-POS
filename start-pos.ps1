@@ -197,6 +197,9 @@ function Test-ApiAccess($User, [string]$Method, [string]$Path, $Request) {
             $submodule = $script:ParsedRequestBody.submodule
         }
         if ($Method -eq "POST" -and $User.role -eq "Reports") { return $false }
+        if ($Method -eq "POST" -and $module -eq "Customers" -and $submodule -in @("Set Initial Customer Balances", "Customer Credit / Debit Notes")) {
+            return $User.role -in @("Admin", "Manager")
+        }
         if ($Method -eq "GET" -and $User.role -eq "Cashier" -and $module -eq "Expenses") {
             return $submodule -eq "Add / Pay For Expenses"
         }
@@ -219,6 +222,9 @@ function Test-ApiAccess($User, [string]$Method, [string]$Path, $Request) {
     }
     if ($Path -eq "/api/customers") {
         return $User.role -in @("Admin", "Manager", "Cashier")
+    }
+    if ($Path -eq "/api/customer-returns") {
+        return $Method -eq "POST" -and $User.role -in @("Admin", "Manager", "Cashier")
     }
     if ($Path -in @("/api/sales", "/api/held-sales") -or $Path -match '^/api/held-sales/[0-9]+$') {
         if ($Method -eq "GET" -and $Path -eq "/api/sales") { return $User.role -ne "Stock Controller" }
@@ -440,13 +446,13 @@ function Invoke-Api($Context) {
     }
 
     if ($method -eq "GET" -and $path -eq "/api/customers") {
-        $json = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',c.id,'name',c.name,'phone',c.phone,'accountType',c.account_type,'creditEnabled',c.credit_enabled,'active',c.active,'outstanding',COALESCE((SELECT sum(s.total-s.paid) FROM sales s WHERE s.customer_id=c.id),0)) ORDER BY c.name),'[]'::json)::text FROM customers c WHERE c.active;"
+        $json = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',c.id,'name',c.name,'phone',c.phone,'accountType',c.account_type,'creditEnabled',c.credit_enabled,'active',c.active,'createdAt',c.created_at,'outstanding',COALESCE((SELECT sum(greatest(s.total-s.paid,0)) FROM sales s WHERE s.customer_id=c.id),0)+COALESCE((SELECT sum(CASE WHEN workflow->>'type'='customer-opening-balance' THEN COALESCE((workflow->>'balance')::numeric,0) WHEN workflow->>'type'='customer-account-note' AND workflow->>'noteType'='debit' THEN COALESCE((workflow->>'amount')::numeric,0) WHEN workflow->>'type'='customer-account-note' AND workflow->>'noteType'='credit' THEN -COALESCE((workflow->>'amount')::numeric,0) ELSE 0 END) FROM module_entries entry CROSS JOIN LATERAL (SELECT entry.record->'workflow' AS workflow) note WHERE entry.module_name='Customers' AND workflow->>'customerId'=c.id::text),0)) ORDER BY c.name),'[]'::json)::text FROM customers c WHERE c.active;"
         Send-Response $Context 200 "application/json; charset=utf-8" $json
         return
     }
 
     if ($method -eq "GET" -and $path -eq "/api/sales") {
-        $json = Invoke-Database "SELECT json_build_object('nextReceipt',COALESCE((SELECT max(receipt_number)+1 FROM sales),46449),'sales',(SELECT COALESCE(json_agg(record ORDER BY created_at DESC),'[]'::json) FROM (SELECT s.created_at,json_build_object('id',s.id,'receiptNumber',s.receipt_number,'customer',s.customer_name,'total',s.total,'paid',s.paid,'balance',greatest(s.total-s.paid,0),'status',s.status,'createdAt',s.created_at,'salesperson',s.salesperson,'storeLocation',s.store_location,'payment',COALESCE((SELECT string_agg(DISTINCT p.method,' + ' ORDER BY p.method) FROM sale_payments p WHERE p.sale_id=s.id),'Credit'),'payments',COALESCE((SELECT json_agg(json_build_object('method',p.method,'amount',p.amount) ORDER BY p.id) FROM sale_payments p WHERE p.sale_id=s.id),'[]'::json),'items',COALESCE((SELECT json_agg(json_build_object('productId',i.product_id,'name',i.product_name,'sku',i.sku,'quantity',i.quantity,'unit',i.unit,'price',i.unit_price,'total',i.line_total)) FROM sale_items i WHERE i.sale_id=s.id),'[]'::json)) AS record FROM sales s) sale_rows))::text;"
+        $json = Invoke-Database "SELECT json_build_object('nextReceipt',COALESCE((SELECT max(receipt_number)+1 FROM sales),46449),'sales',(SELECT COALESCE(json_agg(record ORDER BY created_at DESC),'[]'::json) FROM (SELECT s.created_at,json_build_object('id',s.id,'receiptNumber',s.receipt_number,'customerId',s.customer_id,'customer',s.customer_name,'total',s.total,'paid',s.paid,'balance',greatest(s.total-s.paid,0),'status',s.status,'createdAt',s.created_at,'salesperson',s.salesperson,'storeLocation',s.store_location,'payment',COALESCE((SELECT string_agg(DISTINCT p.method,' + ' ORDER BY p.method) FROM sale_payments p WHERE p.sale_id=s.id),'Credit'),'payments',COALESCE((SELECT json_agg(json_build_object('method',p.method,'amount',p.amount) ORDER BY p.id) FROM sale_payments p WHERE p.sale_id=s.id),'[]'::json),'items',COALESCE((SELECT json_agg(json_build_object('productId',i.product_id,'name',i.product_name,'sku',i.sku,'quantity',i.quantity,'unit',i.unit,'price',i.unit_price,'total',i.line_total)) FROM sale_items i WHERE i.sale_id=s.id),'[]'::json)) AS record FROM sales s) sale_rows))::text;"
         Send-Response $Context 200 "application/json; charset=utf-8" $json
         return
     }
@@ -461,9 +467,31 @@ function Invoke-Api($Context) {
     }
 
     if ($method -eq "POST" -and $path -eq "/api/customers") {
-        $payload = Get-EncodedPayload (Read-RequestJson $request)
-        $json = Invoke-Database "WITH p AS (SELECT convert_from(decode('$payload','base64'),'UTF8')::jsonb AS data), saved AS (INSERT INTO customers(name,phone,account_type,credit_enabled) SELECT btrim(data->>'name'),COALESCE(data->>'phone',''),'Retail',false FROM p WHERE NULLIF(btrim(data->>'name'),'') IS NOT NULL RETURNING id,name,phone,account_type,credit_enabled,active) SELECT json_build_object('id',id,'name',name,'phone',phone,'accountType',account_type,'creditEnabled',credit_enabled,'active',active)::text FROM saved;"
+        $customerBody = Read-RequestJson $request
+        if ([string]::IsNullOrWhiteSpace([string]$customerBody.name)) { throw "Customer name is required." }
+        $encodedName = Get-EncodedPayload @{ name = [string]$customerBody.name }
+        if ([int](Invoke-Database "WITH p AS (SELECT convert_from(decode('$encodedName','base64'),'UTF8')::jsonb AS data) SELECT count(*) FROM customers CROSS JOIN p WHERE lower(customers.name)=lower(btrim(p.data->>'name'));") -gt 0) {
+            throw "A customer with that name already exists."
+        }
+        $accountType = [string]$customerBody.accountType
+        if (-not $accountType) { $accountType = "Retail" }
+        if ($accountType -notin @("Retail", "Credit account")) { throw "Select a valid customer account type." }
+        $creditEnabled = $accountType -eq "Credit account"
+        if ($creditEnabled -and $user.role -notin @("Admin", "Manager")) { throw "Only an administrator or manager may open a customer credit account." }
+        $customerBody | Add-Member -NotePropertyName accountType -NotePropertyValue $accountType -Force
+        $customerBody | Add-Member -NotePropertyName creditEnabled -NotePropertyValue $creditEnabled -Force
+        $payload = Get-EncodedPayload $customerBody
+        $json = Invoke-Database "WITH p AS (SELECT convert_from(decode('$payload','base64'),'UTF8')::jsonb AS data), saved AS (INSERT INTO customers(name,phone,account_type,credit_enabled) SELECT btrim(data->>'name'),COALESCE(btrim(data->>'phone'),''),data->>'accountType',(data->>'creditEnabled')::boolean FROM p RETURNING id,name,phone,account_type,credit_enabled,active,created_at) SELECT json_build_object('id',id,'name',name,'phone',phone,'accountType',account_type,'creditEnabled',credit_enabled,'active',active,'createdAt',created_at,'outstanding',0)::text FROM saved;"
         if (-not $json) { throw "Customer name is required." }
+        Send-Response $Context 201 "application/json; charset=utf-8" $json
+        return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/customer-returns") {
+        $returnBody = Read-RequestJson $request
+        $returnBody | Add-Member -NotePropertyName recordedBy -NotePropertyValue $user.fullName -Force
+        $payload = Get-EncodedPayload $returnBody
+        $json = Invoke-Database "SELECT create_customer_return(convert_from(decode('$payload','base64'),'UTF8')::jsonb)::text;"
         Send-Response $Context 201 "application/json; charset=utf-8" $json
         return
     }
@@ -592,6 +620,68 @@ function Invoke-Api($Context) {
             $amountValid = [decimal]::TryParse([string]$body.record.workflow.amount, [Globalization.NumberStyles]::Number, [Globalization.CultureInfo]::InvariantCulture, [ref]$expenseAmount)
             if (-not $amountValid -or $expenseAmount -le 0 -or [string]::IsNullOrWhiteSpace([string]$body.record.workflow.payee)) {
                 throw "A counter expense requires a payee and an amount greater than zero."
+            }
+        }
+        if ($body.module -eq "Customers") {
+            $workflow = $body.record.workflow
+            $customerId = [long]0
+            if (-not [long]::TryParse([string]$workflow.customerId, [ref]$customerId) -or $customerId -le 0) {
+                throw "Select a valid customer."
+            }
+            if ($body.submodule -eq "Set Initial Customer Balances" -and $workflow.type -eq "customer-opening-balance") {
+                $openingAmount = [decimal]0
+                $openingBalance = [decimal]0
+                $amountValid = [decimal]::TryParse([string]$workflow.amount, [Globalization.NumberStyles]::Number, [Globalization.CultureInfo]::InvariantCulture, [ref]$openingAmount)
+                $balanceValid = [decimal]::TryParse([string]$workflow.balance, [Globalization.NumberStyles]::Number, [Globalization.CultureInfo]::InvariantCulture, [ref]$openingBalance)
+                $expectedBalance = if ($workflow.direction -eq "credit") { -$openingAmount } else { $openingAmount }
+                if ($workflow.direction -notin @("due", "credit") -or
+                    -not $amountValid -or -not $balanceValid -or $openingAmount -le 0 -or
+                    $openingAmount -gt 1000000000 -or [decimal]::Truncate($openingAmount * 100) -ne $openingAmount * 100 -or
+                    $openingBalance -ne $expectedBalance) {
+                    throw "Opening balance must be a non-zero amount within the supported range."
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$workflow.reference) -or [string]::IsNullOrWhiteSpace([string]$workflow.reason)) {
+                    throw "An opening balance reference and reason are required."
+                }
+            } elseif ($body.submodule -eq "Customer Credit / Debit Notes" -and $workflow.type -eq "customer-account-note") {
+                $noteAmount = [decimal]0
+                if ($workflow.noteType -notin @("credit", "debit") -or
+                    -not [decimal]::TryParse([string]$workflow.amount, [Globalization.NumberStyles]::Number, [Globalization.CultureInfo]::InvariantCulture, [ref]$noteAmount) -or
+                    $noteAmount -le 0 -or $noteAmount -gt 1000000000 -or [decimal]::Truncate($noteAmount * 100) -ne $noteAmount * 100) {
+                    throw "Choose a valid credit or debit note amount greater than zero."
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$workflow.reference) -or [string]::IsNullOrWhiteSpace([string]$workflow.reason)) {
+                    throw "A note reference and reason are required."
+                }
+            } elseif ($body.submodule -eq "Correct Wrong Receipt" -and $workflow.type -eq "customer-correction-request") {
+                if ([string]::IsNullOrWhiteSpace([string]$workflow.reason)) { throw "A correction reason is required." }
+                $receiptNumber = [long]0
+                if (-not [long]::TryParse([string]$workflow.receiptNumber, [ref]$receiptNumber) -or
+                    [int](Invoke-Database "SELECT count(*) FROM sales WHERE receipt_number=$receiptNumber AND customer_id=$customerId AND status='Complete';") -ne 1) {
+                    throw "Select a completed receipt for this customer."
+                }
+            } elseif ($body.submodule -eq "Correct Wrong Receipt" -and $workflow.type -eq "customer-correction-decision") {
+                if ($user.role -notin @("Admin", "Manager")) { throw "Only an administrator or manager may decide receipt correction requests." }
+                $requestId = [long]0
+                if ($workflow.decision -notin @("approved", "rejected") -or
+                    -not [long]::TryParse([string]$workflow.requestId, [ref]$requestId) -or
+                    [int](Invoke-Database "SELECT count(*) FROM module_entries WHERE id=$requestId AND module_name='Customers' AND submodule_name='Correct Wrong Receipt' AND record->'workflow'->>'type'='customer-correction-request' AND record->'workflow'->>'customerId'='$customerId';") -ne 1) {
+                    throw "Select a valid pending receipt correction request."
+                }
+                if ([int](Invoke-Database "SELECT count(*) FROM module_entries WHERE module_name='Customers' AND submodule_name='Correct Wrong Receipt' AND record->'workflow'->>'type'='customer-correction-decision' AND record->'workflow'->>'requestId'='$requestId';") -gt 0) {
+                    throw "This receipt correction request has already been reviewed."
+                }
+            } else {
+                throw "This customer workflow is not supported."
+            }
+            if ([int](Invoke-Database "SELECT count(*) FROM customers WHERE id=$customerId AND active;") -ne 1) {
+                throw "The selected customer is not active."
+            }
+            switch ($workflow.type) {
+                "customer-opening-balance" { $workflow | Add-Member -NotePropertyName recordedBy -NotePropertyValue $user.fullName -Force }
+                "customer-account-note" { $workflow | Add-Member -NotePropertyName recordedBy -NotePropertyValue $user.fullName -Force }
+                "customer-correction-request" { $workflow | Add-Member -NotePropertyName requestedBy -NotePropertyValue $user.fullName -Force }
+                "customer-correction-decision" { $workflow | Add-Member -NotePropertyName decidedBy -NotePropertyValue $user.fullName -Force }
             }
         }
         $payload = Get-EncodedPayload $body

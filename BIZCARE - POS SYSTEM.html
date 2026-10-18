@@ -611,8 +611,9 @@
 
         <section class="page" id="page-customers">
           <div class="page-heading"><div><div class="eyebrow">People / Customer accounts</div><h1>Customers</h1><p class="subheading">Manage customer accounts and credit balances.</p></div><button class="button button-primary" id="customer-page-add">＋ Add customer</button></div>
-          <div class="metric-grid"><article class="panel metric-card"><div class="metric-label">Registered customers</div><div class="metric-value" id="customer-count">1,248</div><div class="metric-note">Customer accounts in the system</div></article><article class="panel metric-card"><div class="metric-label">Credit customers</div><div class="metric-value">84</div><div class="metric-note">With an active account</div></article><article class="panel metric-card"><div class="metric-label">Outstanding balance</div><div class="metric-value">KSh 128,600</div><div class="metric-note">Across customer accounts</div></article><article class="panel metric-card"><div class="metric-label">Added this month</div><div class="metric-value">26</div><div class="metric-note">New customer accounts</div></article></div>
-          <section class="panel data-panel"><div class="data-panel-head"><h2>Customer directory</h2><span>Sample records for this UI preview</span></div><div class="table-wrap"><table><thead><tr><th>Customer</th><th>Phone</th><th>Account type</th><th>Outstanding</th><th>Status</th></tr></thead><tbody id="customer-rows"></tbody></table></div></section>
+          <div class="module-toolbar"><div class="search-wrap"><span class="search-icon">⌕</span><input class="search-input" id="customer-search" type="search" placeholder="Search customers by name or phone…" aria-label="Search customers"></div><button class="button button-light" id="customer-invoices" type="button">View customer invoices</button></div>
+          <div class="metric-grid"><article class="panel metric-card"><div class="metric-label">Registered customers</div><div class="metric-value" id="customer-count">0</div><div class="metric-note">Active customer accounts</div></article><article class="panel metric-card"><div class="metric-label">Credit customers</div><div class="metric-value" id="customer-credit-count">0</div><div class="metric-note">With an approved credit account</div></article><article class="panel metric-card"><div class="metric-label">Outstanding balance</div><div class="metric-value" id="customer-outstanding-total">KSh 0</div><div class="metric-note">Net customer balances due</div></article><article class="panel metric-card"><div class="metric-label">Added this month</div><div class="metric-value" id="customer-added-count">0</div><div class="metric-note">New customer accounts</div></article></div>
+          <section class="panel data-panel"><div class="data-panel-head"><h2>Customer directory</h2><span id="customer-directory-hint">Customer records from PostgreSQL</span></div><div class="table-wrap"><table><thead><tr><th>Customer</th><th>Phone</th><th>Account type</th><th>Outstanding</th><th>Status</th><th>Invoices</th></tr></thead><tbody id="customer-rows"></tbody></table></div></section>
         </section>
 
         <section class="page" id="page-reports">
@@ -635,6 +636,24 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <dialog id="customer-dialog" aria-labelledby="customer-dialog-title">
+    <section class="account-form customer-dialog">
+      <h2 id="customer-dialog-title">Add customer</h2>
+      <p>Create a customer account for checkout, invoices, returns and account notes.</p>
+      <form id="customer-create-form">
+        <div class="account-fields">
+          <label>Customer / business name<input class="field" name="name" maxlength="120" autocomplete="name" required></label>
+          <label>Phone number<input class="field" name="phone" type="tel" maxlength="40" autocomplete="tel"></label>
+          <label>Account type<select class="field" name="accountType" required><option value="Retail">Retail</option><option value="Credit account">Credit account</option></select></label>
+        </div>
+        <div class="account-actions">
+          <button class="button button-primary" type="submit">Save customer</button>
+          <button class="button button-light" id="customer-dialog-cancel" type="button">Cancel</button>
+          <span class="login-error" id="customer-create-error" role="alert"></span>
+        </div>
+      </form>
+    </section>
+  </dialog>
   <dialog id="receipt-dialog" aria-labelledby="receipt-complete-title">
     <div class="receipt">
       <div class="receipt-complete-title" id="receipt-complete-title">Sale completed</div>
@@ -796,6 +815,7 @@
       let receiptNumber = 46449;
       let currentModule = "";
       let currentModuleView = "";
+      let selectedInvoiceCustomerId = null;
       let authToken = sessionStorage.getItem("stanam-pos-token") || "";
       let currentUser = null;
       const moduleExtraRows = {};
@@ -1095,21 +1115,58 @@
           showToast("Connect to PostgreSQL before adding a customer.");
           return;
         }
-        const name = prompt("Customer or business name:");
-        if (name === null || !name.trim()) return;
-        const phone = prompt("Phone number (optional):") || "";
+        const form = byId("customer-create-form");
+        const accountType = form.elements.namedItem("accountType");
+        const creditOption = [...accountType.options].find(option => option.value === "Credit account");
+        const canOpenCredit = ["Admin", "Manager"].includes(currentUser.role);
+        creditOption.hidden = !canOpenCredit;
+        creditOption.disabled = !canOpenCredit;
+        if (!canOpenCredit) accountType.value = "Retail";
+        form.reset();
+        if (!canOpenCredit) accountType.value = "Retail";
+        byId("customer-create-error").textContent = "";
+        byId("customer-dialog").showModal();
+        form.elements.namedItem("name").focus();
+      }
+
+      async function saveNewCustomer(event) {
+        event.preventDefault();
+        const form = byId("customer-create-form");
+        const submit = form.querySelector('button[type="submit"]');
+        const errorMessage = byId("customer-create-error");
+        errorMessage.textContent = "";
+        if (!databaseConnected) {
+          errorMessage.textContent = "Connect to PostgreSQL before adding a customer.";
+          return;
+        }
+        submit.disabled = true;
         try {
           const saved = await apiRequest("/api/customers", {
             method: "POST",
-            body: JSON.stringify({ name: name.trim(), phone: phone.trim() })
+            body: JSON.stringify({
+              name: form.elements.namedItem("name").value.trim(),
+              phone: form.elements.namedItem("phone").value.trim(),
+              accountType: form.elements.namedItem("accountType").value
+            })
           });
-          customers.push({ ...saved, id: Number(saved.id), creditEnabled: Boolean(saved.creditEnabled) });
-          customerRecords.push([saved.name, saved.phone || "—", saved.accountType, money(0)]);
+          const customer = {
+            ...saved,
+            id: Number(saved.id),
+            creditEnabled: Boolean(saved.creditEnabled),
+            outstanding: Number(saved.outstanding || 0)
+          };
+          customers.push(customer);
+          customerRecords.push([customer.name, customer.phone || "—", customer.accountType, money(customer.outstanding)]);
           fillCustomerOptions(saved.name);
+          byId("customer-select").value = saved.name;
           renderCustomers();
+          byId("customer-dialog").close();
+          form.reset();
           showToast(`${saved.name} was saved to PostgreSQL.`);
         } catch (error) {
-          showToast(`Customer was not saved: ${error.message}`);
+          errorMessage.textContent = `Customer was not saved: ${error.message}`;
+        } finally {
+          submit.disabled = false;
         }
       }
 
@@ -1752,6 +1809,450 @@
         ];
       }
 
+      function customerSelectOptions(items = customers) {
+        return [
+          { value: "", label: "Select customer" },
+          ...items.map(customer => ({
+            value: String(customer.id),
+            label: `${customer.name}${customer.phone ? ` · ${customer.phone}` : ""}`
+          }))
+        ];
+      }
+
+      function prepareCustomerWorkflow(description) {
+        const summary = byId("module-summary");
+        summary.className = "module-summary counter-workflow customer-workflow";
+        summary.replaceChildren();
+        byId("module-description").textContent = description;
+        byId("module-action").hidden = true;
+        byId("module-shortcuts").hidden = false;
+        byId("module-shortcuts").parentElement.querySelector(".module-toolbar").hidden = true;
+        byId("module-table-body").closest(".data-panel").hidden = true;
+        return summary;
+      }
+
+      async function loadCustomerEntries(submodule) {
+        const query = new URLSearchParams({ module: "Customers", submodule });
+        return apiRequest(`/api/module?${query}`);
+      }
+
+      async function saveCustomerEntry(submodule, workflow, fields) {
+        if (!databaseConnected) throw new Error("Connect to PostgreSQL before saving customer records.");
+        return apiRequest("/api/module", {
+          method: "POST",
+          body: JSON.stringify({ module: "Customers", submodule, record: { fields, workflow } })
+        });
+      }
+
+      async function refreshCustomerData() {
+        const selectedName = byId("customer-select").value;
+        const rows = await apiRequest("/api/customers");
+        customers.splice(0, customers.length, ...rows.map(customer => ({
+          ...customer,
+          id: Number(customer.id),
+          creditEnabled: Boolean(customer.creditEnabled),
+          outstanding: Number(customer.outstanding || 0)
+        })));
+        customerRecords.splice(0, customerRecords.length, ...customers.map(customer => [
+          customer.name, customer.phone || "—", customer.accountType, money(customer.outstanding)
+        ]));
+        fillCustomerOptions(selectedName);
+        renderCustomers();
+      }
+
+      async function renderCustomerWorkflow() {
+        const view = currentModuleView;
+        const descriptions = {
+          "Customers Invoices": "Review posted receipt totals, payments, and receipt balances by customer. The directory reflects each customer's current balance after account entries.",
+          "Customer Credit / Debit Notes": "Record auditable account adjustments. Credit notes reduce the balance; debit notes increase it.",
+          "Set Initial Customer Balances": "Add a signed opening-balance entry to a customer's existing account history.",
+          "Correct Wrong Receipt": "Submit an auditable receipt correction request. Managers and administrators record a separate approval decision; posted receipts are never rewritten.",
+          "GRN From Customers": "Receive customer returns against original receipt lines. Only inspected, saleable goods return to stock; the original line value is credited to the customer's account."
+        };
+        const summary = prepareCustomerWorkflow(descriptions[view] || moduleDescriptions.Customers);
+        if (view === "Customers Invoices") {
+          const filterPanel = workflowPanel("Invoice history", "Invoices are loaded from completed POS sales; balances include payments and posted customer account entries.");
+          const filter = document.createElement("label");
+          filter.textContent = "Customer";
+          filter.style.maxWidth = "420px";
+          filter.style.display = "grid";
+          filter.style.gap = "5px";
+          const select = document.createElement("select");
+          select.className = "field";
+          customerSelectOptions().forEach(item => {
+            const option = document.createElement("option");
+            option.value = item.value;
+            option.textContent = item.label;
+            select.append(option);
+          });
+          if (selectedInvoiceCustomerId) select.value = String(selectedInvoiceCustomerId);
+          select.addEventListener("change", () => {
+            selectedInvoiceCustomerId = Number(select.value) || null;
+            void renderCustomerWorkflow();
+          });
+          filter.append(select);
+          filterPanel.append(filter);
+          summary.append(filterPanel);
+          const selectedCustomer = customers.find(customer => customer.id === selectedInvoiceCustomerId);
+          if (selectedCustomer) {
+            const accountPanel = workflowPanel(
+              `Current account · ${selectedCustomer.name}`,
+              "This balance includes unpaid completed sales, opening balances, and posted credit or debit notes."
+            );
+            const balance = document.createElement("strong");
+            const amount = Number(selectedCustomer.outstanding || 0);
+            balance.textContent = amount < 0 ? `Credit ${money(Math.abs(amount))}` : `Due ${money(amount)}`;
+            accountPanel.append(balance);
+            summary.append(accountPanel);
+          }
+          const invoices = savedSales.filter(sale => !selectedInvoiceCustomerId || Number(sale.customerId) === selectedInvoiceCustomerId);
+          const list = workflowPanel("Completed invoices", `${invoices.length} completed receipts`);
+          list.append(workflowTable(
+            ["Receipt", "Date", "Customer", "Total", "Paid", "Balance", "Status"],
+            invoices.map(sale => [
+              `#${sale.receiptNumber}`,
+              sale.createdAt ? new Intl.DateTimeFormat("en-KE", { dateStyle: "medium", timeStyle: "short" }).format(new Date(sale.createdAt)) : "—",
+              sale.customer,
+              money(Number(sale.total)),
+              money(Number(sale.paid)),
+              money(Number(sale.balance)),
+              sale.status || "Complete"
+            ]),
+            "No completed invoices match this customer."
+          ));
+          summary.append(list);
+          return;
+        }
+
+        if (view === "Customer Credit / Debit Notes") {
+          let entries;
+          try {
+            entries = (await loadCustomerEntries(view))
+              .map(entry => ({ ...entry, workflow: entry.record?.workflow }))
+              .filter(entry => entry.workflow?.type === "customer-account-note");
+          } catch (error) {
+            showToast(`Could not load customer account notes: ${error.message}`);
+            return;
+          }
+          if (["Admin", "Manager"].includes(currentUser.role)) {
+            const form = stockForm("Create an account note", "A note requires a customer, positive amount, reference and reason. The entry is added to the customer ledger.", [
+              { name: "customerId", label: "Customer", options: customerSelectOptions() },
+              { name: "noteType", label: "Note type", options: [{ value: "credit", label: "Credit note · reduce amount due" }, { value: "debit", label: "Debit note · increase amount due" }] },
+              { name: "amount", label: "Amount (KSh)", type: "number", min: "0.01", step: "0.01" },
+              { name: "reference", label: "Reference", maxLength: 80 },
+              { name: "reason", label: "Reason", type: "textarea", maxLength: 240 }
+            ], "Post account note", async values => {
+              const customer = customers.find(item => item.id === Number(values.customerId));
+              if (!customer) throw new Error("Select an active customer.");
+              const amount = Number(values.amount);
+              if (!Number.isFinite(amount) || amount <= 0) throw new Error("Enter an amount greater than zero.");
+              const workflow = {
+                type: "customer-account-note",
+                noteType: values.noteType,
+                customerId: customer.id,
+                customerName: customer.name,
+                amount,
+                reference: String(values.reference).trim(),
+                reason: String(values.reason).trim(),
+                recordedBy: currentUser.name
+              };
+              await saveCustomerEntry(view, workflow, [customer.name, values.noteType, money(amount), workflow.reference, workflow.reason]);
+              await refreshCustomerData();
+              showToast(`${values.noteType === "credit" ? "Credit" : "Debit"} note posted for ${customer.name}.`);
+              void renderCustomerWorkflow();
+            });
+            summary.append(form.panel);
+          } else {
+            const notice = document.createElement("p");
+            notice.className = "workflow-note";
+            notice.textContent = "Only an administrator or manager can post customer account notes.";
+            summary.append(notice);
+          }
+          const list = workflowPanel("Customer account notes", "Return credits appear here with their linked goods-received record.");
+          list.append(workflowTable(
+            ["Customer", "Type", "Amount", "Reference", "Reason", "Receipt / return"],
+            entries.map(({ workflow }) => [
+              workflow.customerName,
+              workflow.noteType === "credit" ? "Credit" : "Debit",
+              money(Number(workflow.amount)),
+              workflow.reference,
+              workflow.reason,
+              workflow.receiptNumber ? `#${workflow.receiptNumber}` : "—"
+            ]),
+            "No customer credit or debit notes have been posted."
+          ));
+          summary.append(list);
+          return;
+        }
+
+        if (view === "Set Initial Customer Balances") {
+          let entries;
+          try {
+            entries = (await loadCustomerEntries(view))
+              .map(entry => ({ ...entry, workflow: entry.record?.workflow }))
+              .filter(entry => entry.workflow?.type === "customer-opening-balance");
+          } catch (error) {
+            showToast(`Could not load opening customer balances: ${error.message}`);
+            return;
+          }
+          if (["Admin", "Manager"].includes(currentUser.role)) {
+            const form = stockForm("Add an opening balance", "This adds an auditable opening entry; it does not replace existing balances or posted invoices.", [
+              { name: "customerId", label: "Customer", options: customerSelectOptions() },
+              { name: "direction", label: "Balance direction", options: [{ value: "due", label: "Customer owes us" }, { value: "credit", label: "We owe the customer" }] },
+              { name: "amount", label: "Opening amount (KSh)", type: "number", min: "0.01", step: "0.01" },
+              { name: "reference", label: "Reference", maxLength: 80 },
+              { name: "reason", label: "Reason / as-of date", type: "textarea", maxLength: 240 }
+            ], "Add opening balance", async values => {
+              const customer = customers.find(item => item.id === Number(values.customerId));
+              if (!customer) throw new Error("Select an active customer.");
+              const amount = Number(values.amount);
+              if (!Number.isFinite(amount) || amount <= 0) throw new Error("Enter an opening amount greater than zero.");
+              const balance = values.direction === "credit" ? -amount : amount;
+              const workflow = {
+                type: "customer-opening-balance",
+                customerId: customer.id,
+                customerName: customer.name,
+                direction: values.direction,
+                amount,
+                balance,
+                reference: String(values.reference).trim(),
+                reason: String(values.reason).trim(),
+                recordedBy: currentUser.name
+              };
+              await saveCustomerEntry(view, workflow, [customer.name, values.direction, money(amount), workflow.reference, workflow.reason]);
+              await refreshCustomerData();
+              showToast(`Opening balance added for ${customer.name}.`);
+              void renderCustomerWorkflow();
+            });
+            summary.append(form.panel);
+          } else {
+            const notice = document.createElement("p");
+            notice.className = "workflow-note";
+            notice.textContent = "Only an administrator or manager can add opening customer balances.";
+            summary.append(notice);
+          }
+          const list = workflowPanel("Opening-balance history", "Opening entries are additive and remain in the audit trail.");
+          list.append(workflowTable(
+            ["Customer", "Direction", "Amount", "Reference", "Reason", "Recorded by"],
+            entries.map(({ workflow }) => [
+              workflow.customerName,
+              workflow.direction === "credit" ? "Credit balance" : "Amount due",
+              money(Number(workflow.amount)),
+              workflow.reference,
+              workflow.reason,
+              workflow.recordedBy
+            ]),
+            "No opening customer balances have been recorded."
+          ));
+          summary.append(list);
+          return;
+        }
+
+        if (view === "Correct Wrong Receipt") {
+          let entries;
+          try {
+            entries = (await loadCustomerEntries(view)).map(entry => ({ ...entry, workflow: entry.record?.workflow }));
+          } catch (error) {
+            showToast(`Could not load receipt correction requests: ${error.message}`);
+            return;
+          }
+          const requests = entries.filter(entry => entry.workflow?.type === "customer-correction-request");
+          const decisions = entries.filter(entry => entry.workflow?.type === "customer-correction-decision");
+          const decisionByRequest = new Map();
+          decisions.forEach(entry => {
+            if (!decisionByRequest.has(Number(entry.workflow.requestId))) decisionByRequest.set(Number(entry.workflow.requestId), entry.workflow);
+          });
+          const pending = requests.filter(entry => !decisionByRequest.has(Number(entry.id)));
+          const form = stockForm("Request a receipt correction", "Choose a completed receipt and describe the issue. The sale stays unchanged while an administrator or manager reviews the request.", [
+            { name: "customerId", label: "Customer", options: customerSelectOptions() },
+            { name: "receiptNumber", label: "Receipt", options: [{ value: "", label: "Select receipt" }] },
+            { name: "reason", label: "Correction reason", type: "textarea", maxLength: 240 }
+          ], "Submit correction request", async values => {
+            const customer = customers.find(item => item.id === Number(values.customerId));
+            const sale = savedSales.find(item => Number(item.receiptNumber) === Number(values.receiptNumber) && Number(item.customerId) === Number(values.customerId));
+            if (!customer || !sale) throw new Error("Select a completed receipt belonging to the selected customer.");
+            const workflow = {
+              type: "customer-correction-request",
+              customerId: customer.id,
+              customerName: customer.name,
+              receiptNumber: sale.receiptNumber,
+              reason: String(values.reason).trim(),
+              requestedBy: currentUser.name
+            };
+            await saveCustomerEntry(view, workflow, [`#${sale.receiptNumber}`, customer.name, workflow.reason, currentUser.name]);
+            showToast(`Correction request for receipt #${sale.receiptNumber} was submitted.`);
+            void renderCustomerWorkflow();
+          });
+          const customerField = form.form.elements.namedItem("customerId");
+          const receiptField = form.form.elements.namedItem("receiptNumber");
+          const updateReceipts = () => {
+            const customerId = Number(customerField.value);
+            const choices = savedSales.filter(sale => Number(sale.customerId) === customerId)
+              .map(sale => ({ value: String(sale.receiptNumber), label: `#${sale.receiptNumber} · ${sale.createdAt ? new Intl.DateTimeFormat("en-KE", { dateStyle: "medium" }).format(new Date(sale.createdAt)) : "Receipt"}` }));
+            receiptField.replaceChildren(...[{ value: "", label: choices.length ? "Select receipt" : "No completed receipts" }, ...choices].map(choice => {
+              const option = document.createElement("option");
+              option.value = choice.value;
+              option.textContent = choice.label;
+              return option;
+            }));
+          };
+          customerField.addEventListener("change", updateReceipts);
+          updateReceipts();
+          summary.append(form.panel);
+          const requestRows = requests.map(entry => {
+            const workflow = entry.workflow;
+            const decision = decisionByRequest.get(Number(entry.id));
+            const action = document.createElement("span");
+            action.textContent = decision ? `${decision.decision} by ${decision.decidedBy || "manager"}${decision.reason ? ` · ${decision.reason}` : ""}` : "Pending review";
+            return [`#${workflow.receiptNumber}`, workflow.customerName, workflow.reason, workflow.requestedBy, action];
+          });
+          const list = workflowPanel("Correction request audit", "Approval decisions are appended separately; no decision rewrites a posted receipt.");
+          list.append(workflowTable(["Receipt", "Customer", "Reason", "Requested by", "Review"], requestRows, "No receipt correction requests have been submitted."));
+          if (["Admin", "Manager"].includes(currentUser.role) && pending.length) {
+            const decisionForm = stockForm("Review a pending request", "Approve or reject without modifying the posted receipt. Follow up with the cashier before making any accounting correction.", [
+              { name: "requestId", label: "Pending request", options: pending.map(entry => ({ value: String(entry.id), label: `#${entry.workflow.receiptNumber} · ${entry.workflow.customerName}` })) },
+              { name: "decision", label: "Decision", options: [{ value: "approved", label: "Approve request" }, { value: "rejected", label: "Reject request" }] },
+              { name: "reason", label: "Decision note", required: false, type: "textarea", maxLength: 240 }
+            ], "Save review decision", async values => {
+              const request = pending.find(entry => Number(entry.id) === Number(values.requestId));
+              if (!request) throw new Error("That request is no longer pending.");
+              const workflow = {
+                type: "customer-correction-decision",
+                requestId: Number(request.id),
+                customerId: Number(request.workflow.customerId),
+                receiptNumber: Number(request.workflow.receiptNumber),
+                decision: values.decision,
+                reason: String(values.reason || "").trim(),
+                decidedBy: currentUser.name
+              };
+              await saveCustomerEntry(view, workflow, [`#${workflow.receiptNumber}`, workflow.decision, workflow.reason, workflow.decidedBy]);
+              showToast(`Correction request for receipt #${workflow.receiptNumber} was ${workflow.decision}.`);
+              void renderCustomerWorkflow();
+            });
+            list.append(decisionForm.panel);
+          } else if (!["Admin", "Manager"].includes(currentUser.role)) {
+            const notice = document.createElement("p");
+            notice.className = "workflow-note";
+            notice.textContent = "Only an administrator or manager can review correction requests.";
+            list.append(notice);
+          }
+          summary.append(list);
+          return;
+        }
+
+        if (view === "GRN From Customers") {
+          let entries;
+          try {
+            entries = (await loadCustomerEntries(view)).map(entry => ({ ...entry, workflow: entry.record?.workflow }))
+              .filter(entry => entry.workflow?.type === "customer-return");
+          } catch (error) {
+            showToast(`Could not load customer returns: ${error.message}`);
+            return;
+          }
+          const saleCustomers = [...new Map(savedSales.filter(sale => sale.customerId)
+            .map(sale => [Number(sale.customerId), customers.find(customer => customer.id === Number(sale.customerId))])
+            .filter(([, customer]) => customer)
+          ).values()];
+          const form = stockForm("Receive goods from a customer", "Returns are limited to unreturned quantities from a completed receipt. Only inspected, saleable goods increase stock; every return issues a credit for the original sale price.", [
+            { name: "customerId", label: "Customer", options: customerSelectOptions(saleCustomers) },
+            { name: "receiptNumber", label: "Original receipt", options: [{ value: "", label: "Select receipt" }] },
+            { name: "productId", label: "Returned product", options: [{ value: "", label: "Select receipt first" }] },
+            { name: "quantity", label: "Quantity returned", type: "number", min: "0.001", step: "0.001" },
+            { name: "condition", label: "Inspection result", options: [{ value: "saleable", label: "Inspected · saleable · restock" }, { value: "unsaleable", label: "Unsaleable · do not restock" }] },
+            { name: "reference", label: "Return reference", maxLength: 80 },
+            { name: "reason", label: "Return reason", type: "textarea", maxLength: 240 }
+          ], "Receive return and credit account", async values => {
+            const customer = customers.find(item => item.id === Number(values.customerId));
+            const sale = savedSales.find(item => Number(item.receiptNumber) === Number(values.receiptNumber) && Number(item.customerId) === Number(values.customerId));
+            const item = sale?.items?.find(line => Number(line.productId) === Number(values.productId));
+            if (!customer || !sale || !item) throw new Error("Select a customer, receipt and product from the original sale.");
+            const quantity = Number(values.quantity);
+            if (!Number.isFinite(quantity) || quantity <= 0) throw new Error("Enter a return quantity greater than zero.");
+            const result = await apiRequest("/api/customer-returns", {
+              method: "POST",
+              body: JSON.stringify({
+                customerId: customer.id,
+                receiptNumber: sale.receiptNumber,
+                productId: item.productId,
+                quantity,
+                condition: values.condition,
+                reference: String(values.reference).trim(),
+                reason: String(values.reason).trim(),
+                recordedBy: currentUser.name
+              })
+            });
+            if (result.restocked) {
+              const product = products.find(entry => entry.id === Number(result.productId));
+              if (product) product.stock = Number(result.stockAfter);
+              renderInventory();
+              renderProducts();
+              renderCart();
+              byId("dashboard-stock").textContent = products.reduce((sum, entry) => sum + entry.stock, 0).toLocaleString("en-KE");
+              byId("dashboard-low").textContent = products.filter(entry => entry.stock < 10).length;
+            }
+            await refreshCustomerData();
+            showToast(`Return received; ${money(Number(result.creditAmount))} credited to ${customer.name}.`);
+            void renderCustomerWorkflow();
+          });
+          const customerField = form.form.elements.namedItem("customerId");
+          const receiptField = form.form.elements.namedItem("receiptNumber");
+          const productField = form.form.elements.namedItem("productId");
+          const updateReceiptAndProductOptions = () => {
+            const customerId = Number(customerField.value);
+            const receipts = savedSales.filter(sale => Number(sale.customerId) === customerId)
+              .map(sale => ({ value: String(sale.receiptNumber), label: `#${sale.receiptNumber}` }));
+            receiptField.replaceChildren(...[{ value: "", label: receipts.length ? "Select receipt" : "No completed receipts" }, ...receipts].map(choice => {
+              const option = document.createElement("option");
+              option.value = choice.value;
+              option.textContent = choice.label;
+              return option;
+            }));
+            updateProductOptions();
+          };
+          const updateProductOptions = () => {
+            const sale = savedSales.find(entry => Number(entry.receiptNumber) === Number(receiptField.value));
+            const choices = (sale?.items || []).map(item => {
+              const returned = entries.filter(entry =>
+                Number(entry.workflow.receiptNumber) === Number(sale.receiptNumber) &&
+                Number(entry.workflow.productId) === Number(item.productId)
+              ).reduce((sum, entry) => sum + Number(entry.workflow.quantity || 0), 0);
+              const available = Number(item.quantity) - returned;
+              return available > 0 ? {
+                value: String(item.productId),
+                label: `${item.name} · ${available} ${item.unit} returnable`
+              } : null;
+            }).filter(Boolean);
+            productField.replaceChildren(...[{ value: "", label: choices.length ? "Select returned product" : "No returnable products" }, ...choices].map(choice => {
+              const option = document.createElement("option");
+              option.value = choice.value;
+              option.textContent = choice.label;
+              return option;
+            }));
+          };
+          customerField.addEventListener("change", updateReceiptAndProductOptions);
+          receiptField.addEventListener("change", updateProductOptions);
+          updateReceiptAndProductOptions();
+          summary.append(form.panel);
+          const list = workflowPanel("Customer goods-received history", "Each posted return links to the original receipt and matching customer credit note.");
+          list.append(workflowTable(
+            ["Return ref.", "Receipt", "Customer", "Product", "Qty", "Inspection", "Stock", "Credit", "Recorded by"],
+            entries.map(({ workflow }) => [
+              workflow.reference,
+              `#${workflow.receiptNumber}`,
+              workflow.customerName,
+              workflow.productName,
+              `${workflow.quantity} ${workflow.unit || ""}`.trim(),
+              workflow.condition === "saleable" ? "Saleable" : "Unsaleable",
+              workflow.restocked ? "Restocked" : "Not restocked",
+              money(Number(workflow.amount)),
+              workflow.recordedBy
+            ]),
+            "No customer goods returns have been recorded."
+          ));
+          summary.append(list);
+        }
+      }
+
       async function loadStockSuppliers() {
         const entries = await loadStockEntries("Suppliers");
         const suppliers = entries.map(entry => entry.record?.workflow).filter(item => item?.type === "supplier");
@@ -2374,6 +2875,10 @@
             void renderStaffList();
             return;
           }
+        }
+        if (currentModule === "Customers") {
+          void renderCustomerWorkflow();
+          return;
         }
         if (currentModule === "Counter") {
           void renderCounterWorkflow();
@@ -3544,9 +4049,50 @@
       }
 
       function renderCustomers() {
-        byId("customer-rows").replaceChildren(...customerRecords.map(customer => {
+        const query = byId("customer-search").value.trim().toLowerCase();
+        const visibleCustomers = customers.filter(customer => `${customer.name} ${customer.phone || ""} ${customer.accountType}`.toLowerCase().includes(query));
+        const now = new Date();
+        const addedThisMonth = customers.filter(customer => {
+          if (!customer.createdAt) return false;
+          const created = new Date(customer.createdAt);
+          return created.getFullYear() === now.getFullYear() && created.getMonth() === now.getMonth();
+        }).length;
+        byId("customer-count").textContent = customers.length.toLocaleString("en-KE");
+        byId("customer-credit-count").textContent = customers.filter(customer => customer.creditEnabled).length.toLocaleString("en-KE");
+        byId("customer-outstanding-total").textContent = money(customers.reduce((sum, customer) => sum + Number(customer.outstanding || 0), 0));
+        byId("customer-added-count").textContent = addedThisMonth.toLocaleString("en-KE");
+        byId("customer-directory-hint").textContent = databaseConnected
+          ? `${customers.length.toLocaleString("en-KE")} active accounts · connected to PostgreSQL`
+          : "Preview data · connect to PostgreSQL to manage customer accounts";
+        byId("customer-rows").replaceChildren(...visibleCustomers.map(customer => {
           const row = document.createElement("tr");
-          row.innerHTML = `<td><strong>${customer[0]}</strong></td><td>${customer[1]}</td><td>${customer[2]}</td><td>${customer[3]}</td><td><span class="table-status">Active</span></td>`;
+          const name = document.createElement("td");
+          const nameText = document.createElement("strong");
+          nameText.textContent = customer.name;
+          name.append(nameText);
+          const phone = document.createElement("td");
+          phone.textContent = customer.phone || "—";
+          const accountType = document.createElement("td");
+          accountType.textContent = customer.accountType;
+          const outstanding = Number(customer.outstanding || 0);
+          const balance = document.createElement("td");
+          balance.textContent = outstanding < 0 ? `Credit ${money(Math.abs(outstanding))}` : money(outstanding);
+          const status = document.createElement("td");
+          const badge = document.createElement("span");
+          badge.className = "table-status";
+          badge.textContent = customer.creditEnabled ? "Credit approved" : "Active";
+          status.append(badge);
+          const actions = document.createElement("td");
+          const invoiceButton = document.createElement("button");
+          invoiceButton.type = "button";
+          invoiceButton.className = "button button-light";
+          invoiceButton.textContent = "Invoices";
+          invoiceButton.addEventListener("click", () => {
+            selectedInvoiceCustomerId = customer.id;
+            openModule("Customers", "Customers Invoices");
+          });
+          actions.append(invoiceButton);
+          row.append(name, phone, accountType, balance, status, actions);
           return row;
         }));
       }
@@ -3845,6 +4391,13 @@
       byId("hold-sale").addEventListener("click", () => { void holdSale(); });
       byId("add-customer").addEventListener("click", addCustomer);
       byId("customer-page-add").addEventListener("click", addCustomer);
+      byId("customer-create-form").addEventListener("submit", event => { void saveNewCustomer(event); });
+      byId("customer-dialog-cancel").addEventListener("click", () => byId("customer-dialog").close());
+      byId("customer-search").addEventListener("input", renderCustomers);
+      byId("customer-invoices").addEventListener("click", () => {
+        selectedInvoiceCustomerId = null;
+        openModule("Customers", "Customers Invoices");
+      });
       byId("inventory-add").addEventListener("click", addProduct);
       byId("report-export").addEventListener("click", () => showToast("Report export is not connected in this local preview."));
       byId("close-receipt").addEventListener("click", () => byId("receipt-dialog").close());

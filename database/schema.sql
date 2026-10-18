@@ -295,4 +295,161 @@ INSERT INTO customers (name, phone, account_type, credit_enabled) VALUES
     ('Kericho Contractors', '0705 116 500', 'Credit account', true)
 ON CONFLICT (name) DO NOTHING;
 
+CREATE OR REPLACE FUNCTION create_customer_return(payload jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    customer_row customers%ROWTYPE;
+    sale_row sales%ROWTYPE;
+    sale_item_row sale_items%ROWTYPE;
+    returned_quantity numeric(14, 3);
+    return_quantity numeric(14, 3);
+    credit_amount numeric(14, 2);
+    stock_after numeric(14, 3);
+    return_entry_id bigint;
+    should_restock boolean;
+BEGIN
+    IF NULLIF(btrim(payload->>'reason'), '') IS NULL OR NULLIF(btrim(payload->>'reference'), '') IS NULL THEN
+        RAISE EXCEPTION 'A return reference and reason are required.';
+    END IF;
+    IF payload->>'condition' IS NULL OR payload->>'condition' NOT IN ('saleable', 'unsaleable') THEN
+        RAISE EXCEPTION 'Choose whether returned goods are inspected and saleable.';
+    END IF;
+    IF (payload->>'quantity') IS NULL OR (payload->>'quantity')::numeric <= 0
+       OR (payload->>'quantity')::numeric > 1000000000
+       OR trunc((payload->>'quantity')::numeric * 1000) <> (payload->>'quantity')::numeric * 1000 THEN
+        RAISE EXCEPTION 'Return quantity must be greater than zero and use no more than three decimal places.';
+    END IF;
+
+    return_quantity := (payload->>'quantity')::numeric;
+    should_restock := payload->>'condition' = 'saleable';
+
+    SELECT * INTO customer_row
+    FROM customers
+    WHERE id = (payload->>'customerId')::bigint AND active
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'The selected customer is not active.';
+    END IF;
+
+    SELECT * INTO sale_row
+    FROM sales
+    WHERE receipt_number = (payload->>'receiptNumber')::bigint
+      AND customer_id = customer_row.id
+      AND status = 'Complete'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'The receipt was not found for this customer.';
+    END IF;
+
+    SELECT * INTO sale_item_row
+    FROM sale_items
+    WHERE sale_id = sale_row.id
+      AND product_id = (payload->>'productId')::bigint
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'The selected product was not sold on this receipt.';
+    END IF;
+
+    SELECT COALESCE(sum((entry.record->'workflow'->>'quantity')::numeric), 0)
+    INTO returned_quantity
+    FROM module_entries entry
+    WHERE entry.module_name = 'Customers'
+      AND entry.submodule_name = 'GRN From Customers'
+      AND entry.record->'workflow'->>'type' = 'customer-return'
+      AND entry.record->'workflow'->>'receiptNumber' = sale_row.receipt_number::text
+      AND entry.record->'workflow'->>'productId' = sale_item_row.product_id::text;
+
+    IF returned_quantity + return_quantity > sale_item_row.quantity THEN
+        RAISE EXCEPTION 'Return quantity exceeds the unreturned quantity on this receipt.';
+    END IF;
+
+    credit_amount := round(sale_item_row.unit_price * return_quantity, 2);
+    IF should_restock THEN
+        UPDATE products
+        SET stock = stock + return_quantity
+        WHERE id = sale_item_row.product_id AND active
+        RETURNING stock INTO stock_after;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'The returned product is no longer active and cannot be restocked.';
+        END IF;
+    END IF;
+
+    INSERT INTO module_entries(module_name, submodule_name, record)
+    VALUES (
+        'Customers',
+        'GRN From Customers',
+        jsonb_build_object(
+            'fields', jsonb_build_array(
+                sale_row.receipt_number,
+                customer_row.name,
+                sale_item_row.product_name,
+                return_quantity,
+                payload->>'condition',
+                payload->>'reference',
+                credit_amount
+            ),
+            'workflow', jsonb_build_object(
+                'type', 'customer-return',
+                'customerId', customer_row.id,
+                'customerName', customer_row.name,
+                'receiptNumber', sale_row.receipt_number,
+                'productId', sale_item_row.product_id,
+                'productName', sale_item_row.product_name,
+                'sku', sale_item_row.sku,
+                'quantity', return_quantity,
+                'condition', payload->>'condition',
+                'restocked', should_restock,
+                'stockAfter', stock_after,
+                'unitPrice', sale_item_row.unit_price,
+                'amount', credit_amount,
+                'reference', btrim(payload->>'reference'),
+                'reason', btrim(payload->>'reason'),
+                'recordedBy', COALESCE(NULLIF(btrim(payload->>'recordedBy'), ''), '')
+            )
+        )
+    )
+    RETURNING id INTO return_entry_id;
+
+    INSERT INTO module_entries(module_name, submodule_name, record)
+    VALUES (
+        'Customers',
+        'Customer Credit / Debit Notes',
+        jsonb_build_object(
+            'fields', jsonb_build_array(
+                customer_row.name,
+                'Credit',
+                credit_amount,
+                'Return ' || btrim(payload->>'reference'),
+                'Receipt #' || sale_row.receipt_number || ': ' || btrim(payload->>'reason')
+            ),
+            'workflow', jsonb_build_object(
+                'type', 'customer-account-note',
+                'noteType', 'credit',
+                'customerId', customer_row.id,
+                'customerName', customer_row.name,
+                'amount', credit_amount,
+                'reference', 'Return ' || btrim(payload->>'reference'),
+                'reason', btrim(payload->>'reason'),
+                'receiptNumber', sale_row.receipt_number,
+                'returnEntryId', return_entry_id,
+                'recordedBy', COALESCE(NULLIF(btrim(payload->>'recordedBy'), ''), '')
+            )
+        )
+    );
+
+    RETURN jsonb_build_object(
+        'id', return_entry_id,
+        'receiptNumber', sale_row.receipt_number,
+        'customerId', customer_row.id,
+        'productId', sale_item_row.product_id,
+        'quantity', return_quantity,
+        'restocked', should_restock,
+        'stockAfter', stock_after,
+        'creditAmount', credit_amount
+    );
+END;
+$$;
+
 COMMIT;
