@@ -11,10 +11,16 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
 $Psql = "C:\Program Files\PostgreSQL\18\bin\psql.exe"
+$PgDump = "C:\Program Files\PostgreSQL\18\bin\pg_dump.exe"
+$PgRestore = "C:\Program Files\PostgreSQL\18\bin\pg_restore.exe"
+$BackupDirectory = "D:\STANAM POS Backups"
+$BackupRetentionDays = 180
+$AutomaticBackupTime = [TimeSpan]::FromHours(17)
 $ConnectionArgs = @("-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", $HostName, "-p", "$Port", "-U", $Username, "-d", $Database)
 $AllowedModules = @("Home", "Settings", "Products", "Stock", "Counter", "Expenses", "Customers", "Reports", "Staff")
 $Roles = @("Admin", "Manager", "Cashier", "Stock Controller", "Reports")
 $script:Sessions = @{}
+$script:LastAutomaticBackupDate = ""
 $Root = [IO.Path]::GetFullPath($PSScriptRoot)
 $RootPrefix = $Root.TrimEnd("\") + "\"
 $listener = $null
@@ -55,7 +61,198 @@ function Get-EncodedPayload([object]$Value) {
     return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
 }
 
+function Write-AuditLog($User, [string]$Action, [string]$Entity, [hashtable]$Details = @{}) {
+    $payload = Get-EncodedPayload @{
+        actorId = if ($User.id) { [long]$User.id } else { $null }
+        actorName = if ($User.fullName) { [string]$User.fullName } else { "System" }
+        actorUsername = if ($User.username) { [string]$User.username } else { "system" }
+        action = $Action
+        entity = $Entity
+        details = $Details
+    }
+    Invoke-Database "WITH p AS (SELECT convert_from(decode('$payload','base64'),'UTF8')::jsonb AS data) INSERT INTO audit_logs(actor_id,actor_name,actor_username,action,entity,details) SELECT NULLIF(data->>'actorId','')::bigint, data->>'actorName', data->>'actorUsername', data->>'action', data->>'entity', data->'details' FROM p;"
+}
+
+function Write-BackupRecord([string]$FileName, [string]$FilePath, [string]$Kind, [string]$Status, [long]$SizeBytes, [string]$CreatedBy, [string]$ErrorMessage = "") {
+    $payload = Get-EncodedPayload @{
+        fileName = $FileName
+        filePath = $FilePath
+        kind = $Kind
+        status = $Status
+        sizeBytes = $SizeBytes
+        createdBy = $CreatedBy
+        errorMessage = $ErrorMessage
+    }
+    return [long](Invoke-Database "WITH p AS (SELECT convert_from(decode('$payload','base64'),'UTF8')::jsonb AS data) INSERT INTO pos_backups(file_name,file_path,kind,status,size_bytes,created_by,error_message) SELECT data->>'fileName',data->>'filePath',data->>'kind',data->>'status',(data->>'sizeBytes')::bigint,data->>'createdBy',data->>'errorMessage' FROM p RETURNING id;")
+}
+
+function Remove-ExpiredAutomaticBackups {
+    $expired = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',id,'filePath',file_path)),'[]'::json)::text FROM pos_backups WHERE kind='automatic' AND created_at < now() - interval '$($script:BackupRetentionDays) days';" | ConvertFrom-Json
+    $backupRoot = [IO.Path]::GetFullPath($script:BackupDirectory).TrimEnd("\") + "\"
+    foreach ($item in $expired) {
+        $filePath = [IO.Path]::GetFullPath([string]$item.filePath)
+        if (-not $filePath.StartsWith($backupRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove an automatic backup outside the configured backup folder."
+        }
+        if (Test-Path -LiteralPath $filePath -PathType Leaf) {
+            Remove-Item -LiteralPath $filePath -ErrorAction Stop
+        }
+        Invoke-Database "DELETE FROM pos_backups WHERE id=$([long]$item.id) AND kind='automatic';"
+    }
+}
+
+function New-PosDatabaseBackup([ValidateSet("manual", "automatic")][string]$Kind, [string]$CreatedBy, $User = $null) {
+    $stamp = [DateTime]::Now.ToString("yyyyMMdd-HHmmssfff", [Globalization.CultureInfo]::InvariantCulture)
+    $fileName = "stanam_pos-$Kind-$stamp.dump"
+    $filePath = Join-Path $script:BackupDirectory $fileName
+    $arguments = @("--no-password", "--format=custom", "--file=$filePath", "--host=$script:HostName", "--port=$script:Port", "--username=$script:Username", "--dbname=$script:Database")
+
+    try {
+        if (-not (Test-Path $script:PgDump -PathType Leaf)) { throw "PostgreSQL backup tool was not found at $script:PgDump." }
+        if (-not (Test-Path $script:PgRestore -PathType Leaf)) { throw "PostgreSQL restore validation tool was not found at $script:PgRestore." }
+        if (-not (Test-Path -LiteralPath $script:BackupDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $script:BackupDirectory -Force -ErrorAction Stop | Out-Null
+        }
+        $dumpOutput = @(& $script:PgDump @arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "pg_dump failed: $($dumpOutput -join "`n")" }
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf) -or (Get-Item -LiteralPath $filePath).Length -le 0) {
+            throw "pg_dump completed without creating a non-empty backup file."
+        }
+        $validationOutput = @(& $script:PgRestore --list $filePath 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "The backup could not be validated: $($validationOutput -join "`n")" }
+
+        $sizeBytes = (Get-Item -LiteralPath $filePath).Length
+        $backupId = Write-BackupRecord $fileName $filePath $Kind "completed" $sizeBytes $CreatedBy
+        if ($Kind -eq "automatic") {
+            try {
+                Write-AuditLog $null "Automatic database backup completed" "Database backup" @{ fileName = $fileName; sizeBytes = $sizeBytes }
+            } catch {
+                Write-Warning "The automatic backup completed, but its audit event could not be recorded: $($_.Exception.Message)"
+            }
+            try { Remove-ExpiredAutomaticBackups }
+            catch { Write-Warning "The backup completed, but expired backups could not be pruned: $($_.Exception.Message)" }
+        }
+        return @{
+            id = $backupId
+            fileName = $fileName
+            kind = $Kind
+            status = "completed"
+            sizeBytes = $sizeBytes
+            createdBy = $CreatedBy
+            createdAt = [DateTime]::Now.ToString("o")
+        }
+    } catch {
+        $errorMessage = $_.Exception.Message
+        if ($errorMessage.Length -gt 1000) { $errorMessage = $errorMessage.Substring(0, 1000) }
+        if (Test-Path -LiteralPath $filePath -PathType Leaf) {
+            Remove-Item -LiteralPath $filePath -ErrorAction SilentlyContinue
+        }
+        try { $null = Write-BackupRecord $fileName $filePath $Kind "failed" 0 $CreatedBy $errorMessage }
+        catch { Write-Warning "Could not record the failed database backup: $($_.Exception.Message)" }
+        try {
+            Write-AuditLog $User "Database backup failed" "Database backup" @{ fileName = $fileName; kind = $Kind; error = $errorMessage }
+        } catch {
+            Write-Warning "The failed database backup could not be written to the audit log: $($_.Exception.Message)"
+        }
+        throw "Database backup failed: $errorMessage"
+    }
+}
+
+function Get-BackupStatus {
+    $rows = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',id,'fileName',file_name,'kind',kind,'status',status,'sizeBytes',size_bytes,'createdBy',created_by,'errorMessage',error_message,'createdAt',created_at) ORDER BY created_at DESC),'[]'::json)::text FROM (SELECT * FROM pos_backups ORDER BY created_at DESC LIMIT 100) recent;" | ConvertFrom-Json
+    $lastAutomaticDate = Invoke-Database "SELECT COALESCE((SELECT value FROM pos_maintenance_state WHERE key='last_automatic_backup_date'),'');"
+    return ConvertTo-JsonResponse @{
+        backups = @($rows)
+        backupDirectory = $script:BackupDirectory
+        automaticBackupTime = "17:00"
+        retentionDays = $script:BackupRetentionDays
+        lastAutomaticBackupDate = $lastAutomaticDate
+    }
+}
+
+function Invoke-ScheduledBackup {
+    $now = [DateTime]::Now
+    if ($now.TimeOfDay -lt $script:AutomaticBackupTime) { return }
+    $today = $now.ToString("yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture)
+    if ($script:LastAutomaticBackupDate -eq $today) { return }
+
+    try {
+        $backup = New-PosDatabaseBackup "automatic" "System (scheduled)"
+        Write-Output "Daily PostgreSQL backup created: $($backup.fileName)"
+    } catch {
+        Write-Warning $_.Exception.Message
+    } finally {
+        $payload = Get-EncodedPayload @{ date = $today }
+        Invoke-Database "WITH p AS (SELECT convert_from(decode('$payload','base64'),'UTF8')::jsonb AS data) INSERT INTO pos_maintenance_state(key,value,updated_at) SELECT 'last_automatic_backup_date',data->>'date',now() FROM p ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=now();"
+        $script:LastAutomaticBackupDate = $today
+    }
+}
+
+function Get-AuditEvent($ResponseBody) {
+    $requestInfo = $script:AuditRequest
+    if (-not $requestInfo) { return $null }
+    $method = [string]$requestInfo.method
+    $path = [string]$requestInfo.path
+    $action = $null
+    $entity = $path
+    $details = @{}
+    switch -Regex ($path) {
+        '^/api/auth/login$' { $action = "Signed in"; $entity = "Staff account"; break }
+        '^/api/auth/logout$' { $action = "Signed out"; $entity = "Staff account"; break }
+        '^/api/auth/password$' { $action = "Changed own password"; $entity = "Staff account"; break }
+        '^/api/staff$' { $action = "Added staff account"; $entity = "Staff"; break }
+        '^/api/staff/([0-9]+)/(role|active|reset-password)$' {
+            $action = switch ($Matches[2]) { "role" { "Changed staff role" } "active" { "Changed staff account status" } default { "Reset staff password" } }
+            $entity = "Staff account"
+            $details.staffId = [long]$Matches[1]
+            break
+        }
+        '^/api/sales$' { $action = "Completed sale"; $entity = "Sale"; break }
+        '^/api/customers$' { $action = "Added customer"; $entity = "Customer"; break }
+        '^/api/customer-returns$' { $action = "Recorded customer return"; $entity = "Customer return"; break }
+        '^/api/products$' { $action = "Added product"; $entity = "Product"; break }
+        '^/api/products/([0-9]+)$' { $action = "Updated product pricing"; $entity = "Product"; $details.productId = [long]$Matches[1]; break }
+        '^/api/stock/movements$' { $action = "Recorded stock movement"; $entity = "Stock"; break }
+        '^/api/module$' {
+            $module = [string]$requestInfo.module
+            $submodule = [string]$requestInfo.submodule
+            $action = "Saved module record"
+            $entity = if ($submodule) { "$module / $submodule" } else { "Module record" }
+            if ($module) { $details.module = $module }
+            if ($submodule) { $details.submodule = $submodule }
+            if ($requestInfo.workflowType) { $details.workflowType = $requestInfo.workflowType }
+            break
+        }
+        '^/api/held-sales$' { $action = "Held sale"; $entity = "Held sale"; break }
+        '^/api/held-sales/([0-9]+)$' { $action = "Deleted held sale"; $entity = "Held sale"; $details.heldSaleId = [long]$Matches[1]; break }
+        '^/api/settings/backups$' { $action = "Created manual database backup"; $entity = "Database backup"; break }
+    }
+    if (-not $action -or $method -notin @("POST", "PATCH", "DELETE")) { return $null }
+
+    try {
+        $result = $ResponseBody | ConvertFrom-Json -ErrorAction Stop
+        foreach ($key in @("id", "entryId", "receiptNumber", "username", "role", "kind", "fileName", "sizeBytes", "creditAmount")) {
+            if ($result.PSObject.Properties.Name -contains $key) { $details[$key] = $result.$key }
+        }
+    } catch {
+        # Successful mutation responses may be empty or non-JSON.
+    }
+    return @{ action = $action; entity = $entity; details = $details }
+}
+
 function Send-Response($Context, [int]$Status, [string]$ContentType, [string]$Body) {
+    if ($Status -lt 400 -and $script:AuditUser -and $script:AuditRequest) {
+        $event = Get-AuditEvent $Body
+        if ($event) {
+            try {
+                Write-AuditLog $script:AuditUser $event.action $event.entity $event.details
+            } catch {
+                Write-Warning "A $($event.entity) operation completed, but its audit event could not be recorded: $($_.Exception.Message)"
+                $Status = 500
+                $Body = '{"error":"The operation may have been saved, but its required audit event could not be recorded. Contact an administrator before retrying."}'
+            }
+        }
+    }
     $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
     $Context.Response.StatusCode = $Status
     $Context.Response.ContentType = $ContentType
@@ -187,6 +384,11 @@ function Test-ModuleAccess($User, [string]$Module, [string]$Submodule) {
 
 function Test-ApiAccess($User, [string]$Method, [string]$Path, $Request) {
     if ($Path -match '^/api/auth/') { return $true }
+    if ($Path -in @("/api/settings/changelog", "/api/settings/audit-logs", "/api/settings/backups")) {
+        if ($User.role -ne "Admin") { return $false }
+        if ($Path -eq "/api/settings/backups") { return $Method -in @("GET", "POST") }
+        return $Method -eq "GET"
+    }
     if ($Path -match '^/api/staff(?:/|$)') { return $User.role -eq "Admin" }
     if ($Path -eq "/api/module") {
         $module = $Request.QueryString["module"]
@@ -292,6 +494,9 @@ function Invoke-Api($Context) {
     $request = $Context.Request
     $path = $request.Url.AbsolutePath
     $method = $request.HttpMethod
+    $script:AuditUser = $null
+    $script:ParsedRequestBody = $null
+    $script:AuditRequest = @{ method = $method; path = $path }
 
     if ($method -eq "GET" -and $path -eq "/api/health") {
         $health = Invoke-Database "SELECT json_build_object('connected', true, 'database', current_database(), 'serverVersion', current_setting('server_version'))::text;"
@@ -320,6 +525,7 @@ function Invoke-Api($Context) {
         $account | Add-Member -NotePropertyName expiresAt -NotePropertyValue ([DateTime]::UtcNow.AddHours(8)) -Force
         $account | Add-Member -NotePropertyName lastSeen -NotePropertyValue ([DateTime]::UtcNow) -Force
         $script:Sessions[$token] = $account
+        $script:AuditUser = $account
         Send-Response $Context 200 "application/json; charset=utf-8" (ConvertTo-JsonResponse @{ token = $token; user = (Get-PublicUser $account) })
         return
     }
@@ -337,6 +543,38 @@ function Invoke-Api($Context) {
 
     if (-not (Test-ApiAccess $user $method $path $request)) {
         Send-Response $Context 403 "application/json; charset=utf-8" '{"error":"Your access role does not allow this action."}'
+        return
+    }
+    $script:AuditUser = $user
+    if ($path -eq "/api/module") {
+        $module = if ($method -eq "POST") { [string]$script:ParsedRequestBody.module } else { [string]$request.QueryString["module"] }
+        $submodule = if ($method -eq "POST") { [string]$script:ParsedRequestBody.submodule } else { [string]$request.QueryString["submodule"] }
+        $workflowType = if ($method -eq "POST" -and $script:ParsedRequestBody.record.workflow.type) { [string]$script:ParsedRequestBody.record.workflow.type } else { "" }
+        $script:AuditRequest.module = $module
+        $script:AuditRequest.submodule = $submodule
+        $script:AuditRequest.workflowType = $workflowType
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/settings/changelog") {
+        $json = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',id,'version',version,'title',title,'description',description,'releasedAt',released_at) ORDER BY released_at DESC),'[]'::json)::text FROM app_changelog;"
+        Send-Response $Context 200 "application/json; charset=utf-8" $json
+        return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/settings/audit-logs") {
+        $json = Invoke-Database "SELECT COALESCE(json_agg(json_build_object('id',id,'actorName',actor_name,'actorUsername',actor_username,'action',action,'entity',entity,'details',details,'createdAt',created_at) ORDER BY created_at DESC),'[]'::json)::text FROM (SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 500) recent;"
+        Send-Response $Context 200 "application/json; charset=utf-8" $json
+        return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/settings/backups") {
+        Send-Response $Context 200 "application/json; charset=utf-8" (Get-BackupStatus)
+        return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/settings/backups") {
+        $backup = New-PosDatabaseBackup "manual" $user.fullName $user
+        Send-Response $Context 201 "application/json; charset=utf-8" (ConvertTo-JsonResponse $backup)
         return
     }
 
@@ -721,15 +959,23 @@ try {
     Initialize-InitialAdmin
     $health = Invoke-Database "SELECT json_build_object('connected', true, 'database', current_database())::text;"
     if (-not $health) { throw "Database connection returned an empty health response." }
+    $script:LastAutomaticBackupDate = Invoke-Database "SELECT COALESCE((SELECT value FROM pos_maintenance_state WHERE key='last_automatic_backup_date'),'');"
 
     $listener = New-Object Net.HttpListener
     $listener.Prefixes.Add("http://127.0.0.1:$WebPort/")
     $listener.Start()
     Write-Output "STANAM POS is ready at http://127.0.0.1:$WebPort/"
-    Write-Output "Connected to PostgreSQL database '$Database'. Press Ctrl+C to stop."
+    Write-Output "Connected to PostgreSQL database '$Database'. Daily backups run at 17:00 local time while this server is running. Press Ctrl+C to stop."
 
+    $pendingContext = $listener.BeginGetContext($null, $null)
     while ($listener.IsListening) {
-        $context = $listener.GetContext()
+        if (-not $pendingContext.AsyncWaitHandle.WaitOne(15000)) {
+            try { Invoke-ScheduledBackup }
+            catch { Write-Warning "The scheduled backup check failed: $($_.Exception.Message)" }
+            continue
+        }
+        $context = $listener.EndGetContext($pendingContext)
+        $pendingContext = $listener.BeginGetContext($null, $null)
         try {
             $path = $context.Request.Url.AbsolutePath
             if ($path.StartsWith("/api/")) {
@@ -776,6 +1022,9 @@ try {
                     Write-Warning "Could not return the local server error response: $($_.Exception.Message)"
                 }
             }
+        } finally {
+            try { Invoke-ScheduledBackup }
+            catch { Write-Warning "The scheduled backup check failed: $($_.Exception.Message)" }
         }
     }
 } finally {
